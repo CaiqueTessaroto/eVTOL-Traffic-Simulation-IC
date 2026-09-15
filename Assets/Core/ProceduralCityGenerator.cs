@@ -176,15 +176,8 @@ public class ProceduralCityGenerator : MonoBehaviour
 
         for (int i = 0; i < count; i++)
         {
-            var start = RandomBorderCell();
-            var target = RandomBorderCell();
-
-            int guard = 0;
-            while (target == start && guard < 5)
-            {
-                target = RandomBorderCell();
-                guard++;
-            }
+            var (start, side) = RandomBorderCell();
+            var target = RandomCellOnSide(OppositeSide(side));
 
             var path = WalkPath(start, target, straightBias, maxSteps);
             if (path.Count < 2) continue;
@@ -196,15 +189,32 @@ public class ProceduralCityGenerator : MonoBehaviour
         return paths;
     }
 
-    private (int x, int z) RandomBorderCell()
+    // Sides: 0=left, 1=right, 2=top, 3=bottom
+    private ((int x, int z) cell, int side) RandomBorderCell()
     {
-        int side = _rng.Next(4); // 0=left, 1=right, 2=top, 3=bottom
+        int side = _rng.Next(4);
+        return (RandomCellOnSide(side), side);
+    }
+
+    private (int x, int z) RandomCellOnSide(int side)
+    {
         switch (side)
         {
             case 0: return (0, _rng.Next(gridHeight));
             case 1: return (gridWidth - 1, _rng.Next(gridHeight));
             case 2: return (_rng.Next(gridWidth), 0);
             default: return (_rng.Next(gridWidth), gridHeight - 1);
+        }
+    }
+
+    private int OppositeSide(int side)
+    {
+        switch (side)
+        {
+            case 0: return 1; // left -> right
+            case 1: return 0; // right -> left
+            case 2: return 3; // top -> bottom
+            default: return 2; // bottom -> top
         }
     }
 
