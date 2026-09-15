@@ -150,22 +150,23 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::ProceduralCityGenerator
   seed: 12345
   randomizeSeedOnGenerate: 1
-  gridWidth: 12
-  gridHeight: 12
+  generateHighways: 1
+  generateAvenues: 1
+  generateStreets: 1
+  gridWidth: 15
+  gridHeight: 15
   cellSize: 20
   perturbationStrength: 0.25
-  avenuePerturbationFactor: 0.35
-  highwayPerturbationFactor: 0.05
-  avenueInterval: 4
-  highwayInterval: 8
+  highwayCount: 2
+  highwayStraightBias: 0.8
+  avenueCount: 5
+  avenueStraightBias: 0.6
   edgeRemovalChance: 0.15
-  diagonalAddChance: 0.05
   localWidth: 6
   avenueWidth: 12
   highwayWidth: 20
   widthJitter: 1.5
   drawGizmos: 1
-  nodeColor: {r: 1, g: 0.6, b: 0, a: 1}
   localColor: {r: 1, g: 1, b: 1, a: 1}
   avenueColor: {r: 1, g: 0.92156863, b: 0.015686275, a: 1}
   highwayColor: {r: 1, g: 0, b: 0, a: 1}

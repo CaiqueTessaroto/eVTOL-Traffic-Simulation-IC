@@ -4,8 +4,11 @@ using UnityEngine;
 
 /// <summary>
 /// Procedural city street-graph generator (Phase 2).
-/// Highways and Avenues are generated as diagonal lines crossing the grid;
-/// Streets (local roads) are generated as the orthogonal grid.
+/// Highways and Avenues are generated as organic paths: a seeded, biased
+/// random walk across the grid where each step can be straight or diagonal,
+/// chosen randomly but weighted toward the path's target — producing bends
+/// and irregular routes instead of a perfect mathematical grid.
+/// Streets (local roads) fill in the remaining orthogonal grid.
 /// Each road type can be toggled independently for isolated testing.
 /// Deterministic via System.Random + seed.
 /// Attach to an empty GameObject and press Play or use the context menu
@@ -20,9 +23,9 @@ public class ProceduralCityGenerator : MonoBehaviour
     public bool randomizeSeedOnGenerate = false;
 
     [Header("Generation Toggles (for isolated testing)")]
-    [Tooltip("Generate diagonal Highway lines")]
+    [Tooltip("Generate organic Highway paths")]
     public bool generateHighways = true;
-    [Tooltip("Generate diagonal Avenue lines")]
+    [Tooltip("Generate organic Avenue paths")]
     public bool generateAvenues = true;
     [Tooltip("Generate orthogonal local Streets")]
     public bool generateStreets = true;
@@ -35,22 +38,24 @@ public class ProceduralCityGenerator : MonoBehaviour
     [Tooltip("Distance between adjacent grid nodes before perturbation")]
     public float cellSize = 20f;
 
-    [Header("Perturbation")]
+    [Header("Perturbation (Local streets only)")]
     [Tooltip("Max random offset applied to a LOCAL node, as a fraction of cellSize")]
     [Range(0f, 0.5f)]
     public float perturbationStrength = 0.25f;
-    [Tooltip("Perturbation multiplier applied to Avenue nodes (0 = perfectly straight)")]
-    [Range(0f, 1f)]
-    public float avenuePerturbationFactor = 0.35f;
-    [Tooltip("Perturbation multiplier applied to Highway nodes (0 = perfectly straight)")]
-    [Range(0f, 1f)]
-    public float highwayPerturbationFactor = 0.05f;
 
-    [Header("Road Hierarchy (diagonal spacing)")]
-    [Tooltip("Highway diagonal lines run where (x + z) is a multiple of this")]
-    public int highwayInterval = 8;
-    [Tooltip("Avenue diagonal lines run where (x - z) is a multiple of this")]
-    public int avenueInterval = 4;
+    [Header("Highways (organic path)")]
+    [Tooltip("How many highway paths to grow across the city")]
+    public int highwayCount = 3;
+    [Tooltip("0 = wanders freely (very organic), 1 = always continues straight/diagonal once picked (very rigid)")]
+    [Range(0f, 1f)]
+    public float highwayStraightBias = 0.8f;
+
+    [Header("Avenues (organic path)")]
+    [Tooltip("How many avenue paths to grow across the city")]
+    public int avenueCount = 6;
+    [Tooltip("0 = wanders freely (very organic), 1 = always continues straight/diagonal once picked (very rigid)")]
+    [Range(0f, 1f)]
+    public float avenueStraightBias = 0.5f;
 
     [Header("Irregularity (Local streets only)")]
     [Tooltip("Probability [0-1] that a LOCAL grid edge is removed to create irregular blocks. Avenues and Highways are never removed.")]
@@ -77,6 +82,15 @@ public class ProceduralCityGenerator : MonoBehaviour
     public List<CityEdge> Edges { get; private set; } = new List<CityEdge>();
 
     private System.Random _rng;
+    private int _nextEdgeId;
+    private readonly HashSet<(int a, int b)> _usedPairs = new HashSet<(int, int)>();
+    private readonly Dictionary<(int x, int z), RoadType> _intendedType = new Dictionary<(int, int), RoadType>();
+
+    private static readonly (int dx, int dz)[] EightDirections =
+    {
+        (1, 0), (-1, 0), (0, 1), (0, -1),
+        (1, 1), (1, -1), (-1, 1), (-1, -1)
+    };
 
     [Serializable]
     public class CityNode
@@ -111,46 +125,181 @@ public class ProceduralCityGenerator : MonoBehaviour
         }
 
         _rng = new System.Random(seed);
+        _nextEdgeId = 0;
+        _usedPairs.Clear();
+        _intendedType.Clear();
 
         Nodes.Clear();
         Edges.Clear();
 
+        // 1. Plan organic paths first (index space only) so node perturbation
+        //    can already take hierarchy into account.
+        List<List<(int x, int z)>> highwayPaths = generateHighways
+            ? PlanPaths(highwayCount, RoadType.Highway, highwayStraightBias)
+            : new List<List<(int x, int z)>>();
+
+        List<List<(int x, int z)>> avenuePaths = generateAvenues
+            ? PlanPaths(avenueCount, RoadType.Avenue, avenueStraightBias)
+            : new List<List<(int x, int z)>>();
+
+        // 2. Create node positions
         GenerateNodes();
 
-        // Each road type has its own independent generation pass.
-        if (generateHighways) GenerateHighways();
-        if (generateAvenues) GenerateAvenues();
+        // 3. Build edges: highways and avenues first (higher priority),
+        //    streets fill the gaps and never overwrite an existing pair.
+        if (generateHighways) BuildEdgesFromPaths(highwayPaths, RoadType.Highway, highwayWidth);
+        if (generateAvenues) BuildEdgesFromPaths(avenuePaths, RoadType.Avenue, avenueWidth);
         if (generateStreets) GenerateStreets();
 
         PruneIsolatedNodes();
+        RecomputeNodeTypes();
 
-        int highwayCount = Edges.FindAll(e => e.Type == RoadType.Highway).Count;
-        int avenueCount = Edges.FindAll(e => e.Type == RoadType.Avenue).Count;
-        int localCount = Edges.Count - highwayCount - avenueCount;
+        int highwayEdgeCount = Edges.FindAll(e => e.Type == RoadType.Highway).Count;
+        int avenueEdgeCount = Edges.FindAll(e => e.Type == RoadType.Avenue).Count;
+        int localEdgeCount = Edges.Count - highwayEdgeCount - avenueEdgeCount;
 
         Debug.Log($"[ProceduralCityGenerator] Seed {seed}: {Nodes.Count} nodes, " +
-                  $"{Edges.Count} edges ({highwayCount} highway, {avenueCount} avenue, {localCount} local).");
+                  $"{Edges.Count} edges ({highwayEdgeCount} highway, {avenueEdgeCount} avenue, {localEdgeCount} local).");
     }
 
-    // Positive modulo helper (C#'s % can return negative results)
-    private int Mod(int a, int b) => b <= 0 ? 0 : ((a % b) + b) % b;
+    // ---------- Organic path planning ----------
 
-    // A node belongs to a Highway diagonal line where (x + z) % highwayInterval == 0,
-    // and/or an Avenue diagonal line where (x - z) % avenueInterval == 0.
-    // Highway takes precedence over Avenue over Local. Disabled types are ignored.
-    private RoadType ClassifyNode(int x, int z)
+    // Grows `count` paths from a random border cell toward another random
+    // border cell, using a biased random walk over the 8 grid directions.
+    // Each step can be orthogonal (straight) or diagonal, chosen randomly
+    // and weighted toward the target, so the resulting road bends organically
+    // instead of following a fixed formula.
+    private List<List<(int x, int z)>> PlanPaths(int count, RoadType type, float straightBias)
     {
-        bool onHighway = generateHighways && highwayInterval > 0 && Mod(x + z, highwayInterval) == 0;
-        if (onHighway) return RoadType.Highway;
+        var paths = new List<List<(int x, int z)>>();
+        int maxSteps = (gridWidth + gridHeight) * 2;
 
-        bool onAvenue = generateAvenues && avenueInterval > 0 && Mod(x - z, avenueInterval) == 0;
-        if (onAvenue) return RoadType.Avenue;
+        for (int i = 0; i < count; i++)
+        {
+            var start = RandomBorderCell();
+            var target = RandomBorderCell();
 
-        return RoadType.Local;
+            int guard = 0;
+            while (target == start && guard < 5)
+            {
+                target = RandomBorderCell();
+                guard++;
+            }
+
+            var path = WalkPath(start, target, straightBias, maxSteps);
+            if (path.Count < 2) continue;
+
+            paths.Add(path);
+            foreach (var cell in path) MarkIntendedType(cell.x, cell.z, type);
+        }
+
+        return paths;
     }
 
-    // 1. Base grid of node positions, perturbed by seeded noise
-    //    (less perturbation for nodes that sit on a higher-hierarchy diagonal)
+    private (int x, int z) RandomBorderCell()
+    {
+        int side = _rng.Next(4); // 0=left, 1=right, 2=top, 3=bottom
+        switch (side)
+        {
+            case 0: return (0, _rng.Next(gridHeight));
+            case 1: return (gridWidth - 1, _rng.Next(gridHeight));
+            case 2: return (_rng.Next(gridWidth), 0);
+            default: return (_rng.Next(gridWidth), gridHeight - 1);
+        }
+    }
+
+    private List<(int x, int z)> WalkPath((int x, int z) start, (int x, int z) target, float straightBias, int maxSteps)
+    {
+        var path = new List<(int x, int z)> { start };
+        var visited = new HashSet<(int x, int z)> { start };
+        var current = start;
+        (int dx, int dz)? prevDir = null;
+
+        for (int step = 0; step < maxSteps; step++)
+        {
+            if (current == target) break;
+
+            var candidates = new List<(int dx, int dz)>();
+            foreach (var dir in EightDirections)
+            {
+                var next = (x: current.x + dir.dx, z: current.z + dir.dz);
+                if (next.x < 0 || next.x >= gridWidth || next.z < 0 || next.z >= gridHeight) continue;
+                if (visited.Contains(next)) continue;
+                candidates.Add(dir);
+            }
+
+            if (candidates.Count == 0) break; // dead end, stop the path here
+
+            (int dx, int dz) chosen;
+            if (prevDir.HasValue && candidates.Contains(prevDir.Value) && NextFloat(0f, 1f) < straightBias)
+            {
+                // Keep going the same way (straight or diagonal, whichever it already was)
+                chosen = prevDir.Value;
+            }
+            else
+            {
+                // Randomly pick a new direction, weighted toward the target —
+                // this is what makes each step randomly straight or diagonal.
+                chosen = WeightedTowardTarget(candidates, current, target);
+            }
+
+            current = (current.x + chosen.dx, current.z + chosen.dz);
+            path.Add(current);
+            visited.Add(current);
+            prevDir = chosen;
+        }
+
+        return path;
+    }
+
+    private (int dx, int dz) WeightedTowardTarget(List<(int dx, int dz)> candidates, (int x, int z) current, (int x, int z) target)
+    {
+        float toTargetX = target.x - current.x;
+        float toTargetZ = target.z - current.z;
+        float len = Mathf.Sqrt(toTargetX * toTargetX + toTargetZ * toTargetZ);
+        if (len < 0.001f) len = 1f;
+        toTargetX /= len;
+        toTargetZ /= len;
+
+        var weights = new List<float>(candidates.Count);
+        float totalWeight = 0f;
+
+        foreach (var c in candidates)
+        {
+            float dlen = Mathf.Sqrt(c.dx * c.dx + c.dz * c.dz);
+            float dot = (c.dx / dlen) * toTargetX + (c.dz / dlen) * toTargetZ; // -1..1
+            // Every direction keeps some chance (min 0.05) so the walk can still wiggle away from target;
+            // directions aligned with target get progressively more weight.
+            float weight = Mathf.Max(0.05f, dot + 1.1f);
+            weights.Add(weight);
+            totalWeight += weight;
+        }
+
+        float roll = NextFloat(0f, totalWeight);
+        float cumulative = 0f;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            cumulative += weights[i];
+            if (roll <= cumulative) return candidates[i];
+        }
+
+        return candidates[candidates.Count - 1];
+    }
+
+    private void MarkIntendedType(int x, int z, RoadType type)
+    {
+        var key = (x, z);
+        if (!_intendedType.TryGetValue(key, out var existing) || type > existing)
+        {
+            _intendedType[key] = type;
+        }
+    }
+
+    // ---------- Node / edge generation ----------
+
+    // Base grid of node positions, perturbed by seeded noise. Nodes that a
+    // highway/avenue path passes through get little to no perturbation so
+    // the organic path reads clearly against the looser local grid.
     private void GenerateNodes()
     {
         int id = 0;
@@ -161,11 +310,11 @@ public class ProceduralCityGenerator : MonoBehaviour
                 float baseX = x * cellSize;
                 float baseZ = z * cellSize;
 
-                RoadType nodeType = ClassifyNode(x, z);
-                float factor = nodeType switch
+                _intendedType.TryGetValue((x, z), out var intended);
+                float factor = intended switch
                 {
-                    RoadType.Highway => highwayPerturbationFactor,
-                    RoadType.Avenue => avenuePerturbationFactor,
+                    RoadType.Highway => 0.05f,
+                    RoadType.Avenue => 0.3f,
                     _ => 1f
                 };
 
@@ -177,7 +326,7 @@ public class ProceduralCityGenerator : MonoBehaviour
                 {
                     Id = id,
                     Position = new Vector2(baseX + offsetX, baseZ + offsetZ),
-                    Type = nodeType
+                    Type = intended
                 };
 
                 Nodes.Add(node);
@@ -186,52 +335,24 @@ public class ProceduralCityGenerator : MonoBehaviour
         }
     }
 
-    // Highways: diagonal lines along direction (1, -1). The line id (x + z) is
-    // invariant along this direction, so consecutive nodes on the same line
-    // automatically share the same id — no extra lookup needed.
-    private void GenerateHighways()
+    private void BuildEdgesFromPaths(List<List<(int x, int z)>> paths, RoadType type, float baseWidth)
     {
-        if (highwayInterval <= 0) return;
-
-        int edgeId = NextEdgeId();
-        for (int x = 0; x < gridWidth - 1; x++)
+        foreach (var path in paths)
         {
-            for (int z = 1; z < gridHeight; z++)
+            for (int i = 0; i < path.Count - 1; i++)
             {
-                if (Mod(x + z, highwayInterval) != 0) continue;
-
-                int a = GridIndex(x, z);
-                int b = GridIndex(x + 1, z - 1);
-                AddEdge(edgeId++, a, b, RoadType.Highway);
+                int a = GridIndex(path[i].x, path[i].z);
+                int b = GridIndex(path[i + 1].x, path[i + 1].z);
+                AddEdgeIfNew(a, b, type, baseWidth);
             }
         }
     }
 
-    // Avenues: diagonal lines along direction (1, 1). The line id (x - z) is
-    // invariant along this direction.
-    private void GenerateAvenues()
-    {
-        if (avenueInterval <= 0) return;
-
-        int edgeId = NextEdgeId();
-        for (int x = 0; x < gridWidth - 1; x++)
-        {
-            for (int z = 0; z < gridHeight - 1; z++)
-            {
-                if (Mod(x - z, avenueInterval) != 0) continue;
-
-                int a = GridIndex(x, z);
-                int b = GridIndex(x + 1, z + 1);
-                AddEdge(edgeId++, a, b, RoadType.Avenue);
-            }
-        }
-    }
-
-    // Streets: orthogonal grid (right + bottom neighbor), with random removal
-    // for irregular block shapes. Never removes an edge that would isolate a node.
+    // Orthogonal local grid, filling in whatever highways/avenues didn't
+    // already claim. Randomly removes some edges for irregular block shapes,
+    // never isolating a node.
     private void GenerateStreets()
     {
-        int edgeId = NextEdgeId();
         var localEdges = new List<CityEdge>();
 
         for (int x = 0; x < gridWidth; x++)
@@ -242,16 +363,14 @@ public class ProceduralCityGenerator : MonoBehaviour
 
                 if (x + 1 < gridWidth)
                 {
-                    int rightId = GridIndex(x + 1, z);
-                    var e = AddEdge(edgeId++, currentId, rightId, RoadType.Local);
-                    localEdges.Add(e);
+                    var e = AddEdgeIfNew(currentId, GridIndex(x + 1, z), RoadType.Local, localWidth);
+                    if (e != null) localEdges.Add(e);
                 }
 
                 if (z + 1 < gridHeight)
                 {
-                    int downId = GridIndex(x, z + 1);
-                    var e = AddEdge(edgeId++, currentId, downId, RoadType.Local);
-                    localEdges.Add(e);
+                    var e = AddEdgeIfNew(currentId, GridIndex(x, z + 1), RoadType.Local, localWidth);
+                    if (e != null) localEdges.Add(e);
                 }
             }
         }
@@ -273,28 +392,45 @@ public class ProceduralCityGenerator : MonoBehaviour
     }
 
     // Remove nodes that ended up with zero connections
-    // (e.g. a node that only matched a road type which was toggled off)
+    // (e.g. a node only reachable through a road type that was toggled off)
     private void PruneIsolatedNodes()
     {
         Nodes.RemoveAll(n => n.ConnectedEdgeIds.Count == 0);
     }
 
-    private int NextEdgeId() => Edges.Count > 0 ? Edges[Edges.Count - 1].Id + 1 : 0;
-
-    private CityEdge AddEdge(int edgeId, int nodeAId, int nodeBId, RoadType type)
+    // Final pass: a node's Type reflects the highest-priority edge actually
+    // touching it after pruning/removal, so gizmos and downstream systems
+    // read the real graph rather than the original plan.
+    private void RecomputeNodeTypes()
     {
-        float baseWidth = type switch
-        {
-            RoadType.Highway => highwayWidth,
-            RoadType.Avenue => avenueWidth,
-            _ => localWidth
-        };
-        float width = baseWidth + NextFloat(-widthJitter, widthJitter);
+        var lookup = new Dictionary<int, CityEdge>();
+        foreach (var e in Edges) lookup[e.Id] = e;
 
-        var edge = new CityEdge { Id = edgeId, NodeA = nodeAId, NodeB = nodeBId, Width = width, Type = type };
+        foreach (var node in Nodes)
+        {
+            RoadType best = RoadType.Local;
+            foreach (var eid in node.ConnectedEdgeIds)
+            {
+                if (lookup.TryGetValue(eid, out var edge) && edge.Type > best)
+                    best = edge.Type;
+            }
+            node.Type = best;
+        }
+    }
+
+    private CityEdge AddEdgeIfNew(int nodeAId, int nodeBId, RoadType type, float baseWidth)
+    {
+        var pair = nodeAId < nodeBId ? (nodeAId, nodeBId) : (nodeBId, nodeAId);
+        if (_usedPairs.Contains(pair)) return null; // a higher-priority road already claimed this segment
+
+        _usedPairs.Add(pair);
+
+        float width = baseWidth + NextFloat(-widthJitter, widthJitter);
+        var edge = new CityEdge { Id = _nextEdgeId++, NodeA = nodeAId, NodeB = nodeBId, Width = width, Type = type };
+
         Edges.Add(edge);
-        Nodes[nodeAId].ConnectedEdgeIds.Add(edgeId);
-        Nodes[nodeBId].ConnectedEdgeIds.Add(edgeId);
+        Nodes[nodeAId].ConnectedEdgeIds.Add(edge.Id);
+        Nodes[nodeBId].ConnectedEdgeIds.Add(edge.Id);
         return edge;
     }
 
@@ -305,11 +441,12 @@ public class ProceduralCityGenerator : MonoBehaviour
         return (float)(_rng.NextDouble() * (max - min) + min);
     }
 
+    // ---------- Gizmos ----------
+
     private void OnDrawGizmos()
     {
         if (!drawGizmos || Nodes == null || Edges == null) return;
 
-        // Draw local roads first, then avenues, then highways, so hierarchy is visually on top
         DrawEdgesOfType(RoadType.Local, localColor, 1);
         DrawEdgesOfType(RoadType.Avenue, avenueColor, 2);
         DrawEdgesOfType(RoadType.Highway, highwayColor, 3);
@@ -348,7 +485,6 @@ public class ProceduralCityGenerator : MonoBehaviour
                 continue;
             }
 
-            // Draw a few parallel offset lines so wider roads read as thicker in the Scene View
             Vector3 dir = (b - a).normalized;
             Vector3 perpendicular = new Vector3(-dir.z, 0f, dir.x);
             float spread = Mathf.Clamp(edge.Width * 0.05f, 0.2f, highwayGizmoWidth);
